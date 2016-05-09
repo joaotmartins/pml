@@ -1,0 +1,212 @@
+---
+title: "Prediction Assignment Writeup"
+author: "João Martins"
+date: "May 8th 2016"
+output: html_document
+---
+
+# Overview
+This report outlines a prediction model for assessing the correctness in executing a barbell lift exercise.
+
+The model is trained using data from the "Weight Lifting Exercises Data Set" collected by the Human Activity Recognition research group from the Pontifical Catholic University
+of Rio de Janeiro, available at http://groupware.les.inf.puc-rio.br/har .
+
+Using the dataset, a prediction model to assess the correctness in executing it is built. The model classifies an execution using the classes present in the original data ("A" for correct execution, and "B" to "E" for different types of incorrect execution).
+
+# Data loading and manipulation
+
+The dataset consists of labelled samples with an extensive number of features: the roll, pitch, yaw and x,y,z gyroscope, accelleration and magnet position for four measurement points (arm, belt, forearm and the dumbell). Beyond these, the subject's short name and the exercise's timestamp are also recorded.
+
+For each test subject, around 160 samples are taken when the subject is performing the exercise in a certain class. An extra sample that is the summary of these 160 samples (named a window) is then present, with an extensive set of statistics over the recorded features - minimum, maximum, amplitude, variance, standard deviation, skewness and kurtosis. These sample types are distinguished by the "new_window" feature.
+
+We begin processing by loading required libraries:
+```{r, warning=FALSE, message=FALSE}
+library(data.table)
+library(plyr)
+library(dplyr)
+library(randomForest)
+library(gbm)
+library(nnet)
+library(caret)
+library(doParallel)
+library(caretEnsemble)
+```
+
+```{r, echo=FALSE}
+# set working directory
+setwd("D:/userdata/pt100800/My Documents/Training/Coursera/Data Science Specialization/Practical Machine Learning")
+
+```
+
+
+We then load and pre-process the data.
+Since what we aim to predict are actual exercise samples, we cut out the summary samples denoted by a `yes` value in the new_window feature.
+
+We then drop all the derived features that are ony present in the summary samples, as well as the subject's names, sample window indications and timestamp features, since we want our model to predict based on the measurements describing the exercises, not any particular time or sampling window.
+
+Dropping the timestamps will not affect prediction, since a simple scanning of the data shows that they are all the same for a given user and exercise type.
+
+The data is then divided into three sets: training, teesting and validation, with a 70:20:10 proportion. The training set will be used to create several models, with the testing set being used for assessing their behavior and making a final modelling decision. The validation set will then be used to ascertain the final model's expected performance.
+
+```{r, cache=TRUE}
+
+# Load data. The first column is simply a row number we can leave out.
+full_data <- fread(input = "pml-training.csv", drop = c(1))
+
+# leave out the end-of-window rows
+full_data <- filter(full_data, new_window == "no")
+
+cut_unneded_vars <- function(df) {
+        # cut out empty variables that are used at the end of a window
+        varsToCut <- grep("^skewness_|^kurtosis_|^var_|^stddev_|^avg_|^min_|^max|^amplitude", 
+                          names(df), value = TRUE)
+        df <- select(df, -one_of(varsToCut))
+        
+        # cut out variabes that are clearly not needed
+        df <- dplyr::select(df, 
+                     -new_window,
+                     -num_window,
+                     -user_name,
+                     -cvtd_timestamp, 
+                     -raw_timestamp_part_1,
+                     -raw_timestamp_part_2)
+        
+        df
+}
+
+# cut out the end-of-window variables
+full_data <- cut_unneded_vars(full_data)
+
+# make predictor into factor
+full_data$classe <- factor(full_data$classe)
+
+# partition data set into training, testing and validation as 70:20:10 approx.
+inTrain = createDataPartition(full_data$classe, p = 0.70)[[1]]
+training = full_data[inTrain,]
+tv = full_data[-inTrain,]
+
+inTest <- createDataPartition(tv$classe, p = 0.67)[[1]]
+testing <- tv[inTest, ]
+validation <- tv[-inTest, ]
+```
+
+
+# Model building
+Since we are dealing with a classification problem, we will use models suitable for classification, that take as input sets of continuous variables, are robust to the distribution of said variables, and have a history of good performance.
+Since we do not have any indication of which variables are likely to be most relevant for prediction, we will simple use all the 52 features in the data set as inputs.
+
+The chosen models are: 
+* Random forests of decision trees.
+* Penalized Multinomial Regression.
+* K-nearest-neighbors.
+
+These models were chosen because they all operate differently, and therefore each of them may give different results.
+
+Each model was fit over the training data; a model list was constructed with `caretEnsemble` for consistent cross-validation parameters and ease of processing in subsequent steps.
+
+
+```{r, cache = TRUE}
+# register parallel processing
+registerDoParallel(cores = 4)
+
+# limit bootstraps due to large data
+tc <- trainControl(method = "boot", number = 10, savePredictions = "final")
+methods <- c("rf", "multinom", "knn")
+```
+```{r, cache = TRUE}
+set.seed(2342342) # for reproducibility
+modelList <- caretList(classe ~ ., trControl = tc, data = training, 
+                       methodList = methods)
+
+```
+
+# Model assessment
+
+## Cross validation and comparison
+When training the models, `caret` performs bootstrapping to optimize the model parameters and select a final optimal configuration. In this case bootstrapping with 10 resampling iterations was performed; the number of iterations was kept low since the training dataset is relatively large (~ 13000 samples), and a lower number allowed for a reasonably fast training time with the hardware available.
+
+Final model performance was then assessed by testing it against the `testing` dataset and generating a confusion matrix for each model:
+```{r}
+weightedVote <- function(ml, models, testSet) {
+        
+        # predict on every model
+        preds <- predict(ml, newdata = testSet)
+        
+        cms <- list()
+        accs <- list()
+        weights <- list()
+        
+        i <- 1
+        sumAccs <- 0
+        
+        # fill in confusion matrix, accuracies and sum all accuracies
+        for (mName in models) {
+                cm <- confusionMatrix(preds[, mName], testSet$classe)
+                cms[[mName]] <- cm
+                accs[mName] <- cm$overall[1]
+                sumAccs <- sumAccs + accs[[mName]]
+        }
+        
+        # calculate model weights
+        for (mName in models) {
+                weights[mName] <- accs[[mName]] / sumAccs
+        }
+        
+        # calculate votes, given weights
+        votes <- character(length = length(preds[, models[1]]))
+        vs <- matrix(nrow = length(preds[, models[1]]), ncol = 5)
+        
+        for (i in 1:dim(preds)[1]) {
+                v <- vector(length = 5)
+                names(v) <- c("A", "B", "C", "D", "E")
+                
+                for(m in models) {
+                        v[preds[i, m]] <- v[preds[i, m]] + weights[[m]]
+                }
+                
+                vs[i, ] <- v
+                votes[i] <- names(which.max(v))
+        }
+        
+        cmEns <- confusionMatrix(votes, testSet$classe)
+        
+        cms[["ensemble"]] <- cmEns
+        accs["ensemble"] <- cmEns$overall[1]
+        
+        list(cms = cms, preds = preds, accs = accs, 
+                   weights = weights, votes = votes, vs = vs)
+}
+
+wv <- weightedVote(modelList, methods, testing)
+```
+
+This final test gives us a first estimate of the out-of-sample error (because it was assessed using data outside of the training set), and is used to pick a final model.
+
+In addition to the accuracy estimates, an ensemble voting of the three algorithms is also generated and its accuracy estimated.
+
+## Final choice
+A final choice is made by examining the accuracy of the models:
+```{r}
+simplify2array(wv$accs)
+```
+
+Since the accuracy of the random forest and gbm models is so high, it was expected that their combination (ensembling) would not yeld better results. Therefore the final decision is to use the random forest model to perform predictions, since it shows a higher accuracy overall.
+
+A final estimate of the out-of-sample error rate is given by running the model against the `validation` data set, that was created for this purpose:
+```{r}
+confusionMatrix(predict(modelList$rf, newdata = validation), validation$classe)
+```
+
+# Predictions on supplied test data
+
+This section shows the predictions given by the model on the 20 supplied unlabeled test cases:
+```{r}
+pred_test <- fread(input = "pml-testing.csv", drop = c(1))
+
+# apply same pre-processing; no window summary rows present.
+pred_test <- cut_unneded_vars(pred_test)
+
+preds <- predict(modelList$rf, newdata = pred_test)
+
+preds
+```
